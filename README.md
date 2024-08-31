@@ -1,7 +1,7 @@
 
-# CRYFT Vanity Tool
+# CRYFT 0xVanity Tool
 
-CRYFT Vanity Tool is a Python-based GUI application that allows users to search for Ethereum contract addresses and wallet addresses with specific prefixes and suffixes. The application leverages multithreading to enhance the performance of the search process and provides options for saving and encrypting private keys.
+CRYFT 0xVanity Tool is a Python-based GUI application that allows users to search for Ethereum contract addresses and wallet addresses with specific prefixes and suffixes. The application leverages multithreading to enhance the performance of the search process and provides options for saving and encrypting private keys.
 
 ## Table of Contents
 
