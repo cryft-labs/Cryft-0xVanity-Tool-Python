@@ -33,7 +33,6 @@ The tool also requires several Python modules:
 - `eth-account` (for Ethereum account management)
 - `eth-hash` (for keccak hashing)
 - `rlp` (for encoding Ethereum transactions)
-- `web3` (for interacting with Ethereum nodes)
 - `pyperclip` (for clipboard management)
 
 ## Installation
