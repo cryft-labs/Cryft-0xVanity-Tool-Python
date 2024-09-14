@@ -1,12 +1,10 @@
 import tkinter as tk
-from tkinter import messagebox, ttk, simpledialog
+from tkinter import messagebox, ttk, simpledialog, filedialog
 from eth_account import Account
 from eth_hash.auto import keccak
 import rlp
 import json
-from tkinter import filedialog
 import pyperclip
-from web3 import Web3
 import concurrent.futures
 import os
 
@@ -216,6 +214,5 @@ ttk.Label(root, text="Optional", font=('Montserrat', 8)).grid(row=9, column=0, c
 
 ttk.Button(root, text='Enter Private Key', command=input_private_key).grid(row=10, column=0, columnspan=2, padx=10, pady=10)
 ttk.Button(root, text='Search', command=start_search).grid(row=11, column=0, columnspan=2, padx=10, pady=10)
-
 
 root.mainloop()
