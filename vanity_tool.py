@@ -23,6 +23,13 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
+MNEMONIC_AVAILABLE = False
+try:
+    Account.enable_unaudited_hdwallet_features()
+    MNEMONIC_AVAILABLE = True
+except Exception:
+    pass
+
 private_key = None
 cancel_event = threading.Event()
 throughput_cache = {}
@@ -172,7 +179,7 @@ class GPUSearcher:
         self.queue = cl.CommandQueue(self.ctx)
         self.program = cl.Program(self.ctx, KECCAK_KERNEL_SRC).build()
 
-    def search_nonces(self, address_hex, start_nonce, max_nonce, prefix, suffix, batch_size=1 << 20, max_cu=None, stop_event=None):
+    def search_nonces(self, address_hex, start_nonce, max_nonce, prefix, suffix, batch_size=1 << 20, max_cu=None, stop_event=None, utilization_pct=100):
         """Search nonce range on GPU. Returns first matching nonce or None."""
         addr_np = np.frombuffer(bytes.fromhex(address_hex), dtype=np.uint8)
         prefix_np = np.frombuffer(prefix.lower().encode(), dtype=np.uint8) if prefix else np.zeros(1, dtype=np.uint8)
@@ -214,8 +221,16 @@ class GPUSearcher:
                 suffix_buf, np.uint32(slen),
                 results_buf,
             )
+            _batch_t0 = time.perf_counter()
             cl.enqueue_copy(self.queue, results_host, results_buf)
             self.queue.finish()
+
+            # Throttle GPU utilization by sleeping proportionally to batch time
+            if utilization_pct < 100:
+                batch_elapsed = time.perf_counter() - _batch_t0
+                sleep_time = batch_elapsed * (100 - utilization_pct) / max(utilization_pct, 1)
+                if sleep_time > 0.001:
+                    time.sleep(sleep_time)
 
             actual_count = min(batch, max_nonce - current)
             matches = np.where(results_host[:actual_count] == 1)[0]
@@ -748,9 +763,9 @@ def _benchmark_cpu_contract_nonce_rate(sample_nonces=1024):
     throughput_cache[cache_key] = rate
     return rate
 
-def _benchmark_gpu_nonce_rate(gpu_searcher, batch_size, max_cu, sample_batches=1):
+def _benchmark_gpu_nonce_rate(gpu_searcher, batch_size, max_cu, sample_batches=1, utilization_pct=100):
     """Measure GPU nonce throughput with a near-impossible match."""
-    cache_key = ("gpu_nonces", gpu_searcher.device_name, batch_size, max_cu, sample_batches)
+    cache_key = ("gpu_nonces", gpu_searcher.device_name, batch_size, max_cu, sample_batches, utilization_pct)
     if cache_key in throughput_cache:
         return throughput_cache[cache_key]
     total_nonces = max(1, batch_size * sample_batches)
@@ -763,6 +778,7 @@ def _benchmark_gpu_nonce_rate(gpu_searcher, batch_size, max_cu, sample_batches=1
         "",
         batch_size=batch_size,
         max_cu=max_cu,
+        utilization_pct=utilization_pct,
     )
     elapsed = time.perf_counter() - t0
     rate = total_nonces / elapsed if elapsed > 0 else float(total_nonces)
@@ -770,7 +786,8 @@ def _benchmark_gpu_nonce_rate(gpu_searcher, batch_size, max_cu, sample_batches=1
     return rate
 
 def _estimate_keys_per_second(wallet_only, use_gpu, nonce_range, enabled_gpu_count=0,
-                              gpu_searchers=None, gpu_batch_size=1 << 20, gpu_max_cu=None):
+                              gpu_searchers=None, gpu_batch_size=1 << 20, gpu_max_cu=None,
+                              utilization_pct=100):
     """Estimate end-to-end key throughput for the active search mode."""
     cpu_key_rate = _benchmark_key_rate()
 
@@ -784,7 +801,8 @@ def _estimate_keys_per_second(wallet_only, use_gpu, nonce_range, enabled_gpu_cou
 
         def bench_gpu(idx, searcher):
             try:
-                gpu_rates[idx] = _benchmark_gpu_nonce_rate(searcher, gpu_batch_size, gpu_max_cu)
+                gpu_rates[idx] = _benchmark_gpu_nonce_rate(searcher, gpu_batch_size, gpu_max_cu,
+                                                           utilization_pct=utilization_pct)
             except Exception:
                 gpu_rates[idx] = 0.0
 
@@ -877,7 +895,7 @@ def search_with_profanity2(wallet_prefix, wallet_suffix, max_keys, executable_pa
                 derived_addr = Account.from_key(final_key).address
                 if _wallet_matches(derived_addr, wallet_prefix, wallet_suffix):
                     _terminate()
-                    return [(None, None, derived_addr, final_key)]
+                    return [(None, None, derived_addr, final_key, None, None)]
 
             # Detect speed from live output and set deadline from NOW
             # (GPU is actually hashing at this point, init is done)
@@ -907,7 +925,7 @@ def search_with_profanity2(wallet_prefix, wallet_suffix, max_keys, executable_pa
         derived_wallet_address = Account.from_key(final_private_key).address
         if not _wallet_matches(derived_wallet_address, wallet_prefix, wallet_suffix):
             return []
-        return [(None, None, derived_wallet_address, final_private_key)]
+        return [(None, None, derived_wallet_address, final_private_key, None, None)]
     finally:
         _active_profanity2_proc = None
         if process.poll() is None:
@@ -919,7 +937,7 @@ def search_combined_with_profanity2(wallet_prefix, wallet_suffix,
                                     executable_path, selected_indices,
                                     gpu_searcher=None,
                                     gpu_batch_size=1 << 20, gpu_max_cu=None,
-                                    on_speed_detected=None):
+                                    on_speed_detected=None, utilization_pct=100):
     """Combined wallet+contract search.
 
     Uses profanity2 (GPU) for wallet address matching, then checks contract
@@ -943,6 +961,7 @@ def search_combined_with_profanity2(wallet_prefix, wallet_suffix,
                 account.address[2:], start_nonce, max_nonce,
                 contract_prefix, contract_suffix,
                 batch_size=gpu_batch_size, max_cu=gpu_max_cu,
+                utilization_pct=utilization_pct,
             )
         else:
             nonce, _, _, found = search_address(
@@ -953,7 +972,7 @@ def search_combined_with_profanity2(wallet_prefix, wallet_suffix,
                 nonce = None
         if nonce is not None:
             addr = create_contract_address(account, nonce)
-            return [(nonce, addr, account.address, final_key)]
+            return [(nonce, addr, account.address, final_key, None, None)]
         return None
 
     while not cancel_event.is_set():
@@ -1099,7 +1118,22 @@ def search_address(account, wallet_prefix, wallet_suffix, contract_prefix, contr
 
 def _keygen_worker(args):
     """Generate one key and test wallet match. Runs in a child process."""
-    wallet_prefix, wallet_suffix, use_private_key = args
+    wallet_prefix, wallet_suffix, use_private_key, seed_num_words, seed_path_template, seed_depth_val = args
+    if seed_num_words and seed_num_words > 0:
+        # Seed generation mode: generate random mnemonic, derive up to seed_depth_val addresses
+        Account.enable_unaudited_hdwallet_features()
+        acct, mnemonic = Account.create_with_mnemonic(num_words=seed_num_words)
+        path_template = seed_path_template or "m/44'/60'/0'/0/{i}"
+        depth = seed_depth_val or 1
+        for idx in range(depth):
+            path = path_template.replace("{i}", str(idx))
+            try:
+                derived = Account.from_mnemonic(mnemonic, account_path=path)
+            except Exception:
+                continue
+            if _wallet_matches(derived.address, wallet_prefix, wallet_suffix):
+                return derived.address, derived.key.hex(), mnemonic, path
+        return None
     if use_private_key:
         account = Account.from_key(use_private_key)
         local_key = use_private_key
@@ -1107,13 +1141,39 @@ def _keygen_worker(args):
         account = Account.create()
         local_key = account.key.hex()
     if _wallet_matches(account.address, wallet_prefix, wallet_suffix):
-        return account.address, local_key
+        return account.address, local_key, None, None
     return None
 
 
 def _cpu_worker(args):
     """Top-level function so ProcessPoolExecutor can pickle it."""
-    wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, use_private_key = args
+    wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, use_private_key, seed_num_words, seed_path_template, seed_depth_val = args
+    if seed_num_words and seed_num_words > 0:
+        # Seed generation mode
+        Account.enable_unaudited_hdwallet_features()
+        acct, mnemonic = Account.create_with_mnemonic(num_words=seed_num_words)
+        path_template = seed_path_template or "m/44'/60'/0'/0/{i}"
+        depth = seed_depth_val or 1
+        for idx in range(depth):
+            path = path_template.replace("{i}", str(idx))
+            try:
+                derived = Account.from_mnemonic(mnemonic, account_path=path)
+            except Exception:
+                continue
+            local_private_key = derived.key.hex()
+            wallet_address = derived.address
+
+            if not contract_prefix and not contract_suffix:
+                if _wallet_matches(wallet_address, wallet_prefix, wallet_suffix):
+                    return None, None, wallet_address, True, local_private_key, mnemonic, path
+                continue
+
+            nonce, address, wallet_address, found = search_address(
+                derived, wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce
+            )
+            if found:
+                return nonce, address, wallet_address, True, local_private_key, mnemonic, path
+        return None, None, None, False, None, None, None
     if use_private_key:
         local_private_key = use_private_key
         account = Account.from_key(local_private_key)
@@ -1125,20 +1185,21 @@ def _cpu_worker(args):
     # Wallet-only mode: no nonce search needed
     if not contract_prefix and not contract_suffix:
         if not _wallet_matches(wallet_address, wallet_prefix, wallet_suffix):
-            return None, None, None, False, local_private_key
-        return None, None, wallet_address, True, local_private_key
+            return None, None, None, False, local_private_key, None, None
+        return None, None, wallet_address, True, local_private_key, None, None
 
     nonce, address, wallet_address, found = search_address(
         account, wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce
     )
-    return nonce, address, wallet_address, found, local_private_key
+    return nonce, address, wallet_address, found, local_private_key, None, None
 
 
-def search_with_processes(wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, max_keys, use_private_key=None):
+def search_with_processes(wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, max_keys, use_private_key=None,
+                          seed_num_words=0, seed_path_template=None, seed_depth_val=0):
     global _active_executor
     results = []
     worker_count = min(max_keys, cpu_count)
-    args = (wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, use_private_key)
+    args = (wallet_prefix, wallet_suffix, contract_prefix, contract_suffix, start_nonce, max_nonce, use_private_key, seed_num_words, seed_path_template, seed_depth_val)
 
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
     _active_executor = executor
@@ -1149,9 +1210,9 @@ def search_with_processes(wallet_prefix, wallet_suffix, contract_prefix, contrac
         for future in concurrent.futures.as_completed(futures):
             if cancel_event.is_set():
                 break
-            nonce, address, wallet_address, found, local_private_key = future.result()
+            nonce, address, wallet_address, found, local_private_key, mnemonic, deriv_path = future.result()
             if found:
-                results.append((nonce, address, wallet_address, local_private_key))
+                results.append((nonce, address, wallet_address, local_private_key, mnemonic, deriv_path))
                 break
     finally:
         for f in futures:
@@ -1163,7 +1224,9 @@ def search_with_processes(wallet_prefix, wallet_suffix, contract_prefix, contrac
 
 def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contract_suffix,
                          start_nonce, max_nonce, max_keys, gpu_searchers,
-                         use_private_key=None, gpu_batch_size=1 << 20, gpu_max_cu=None):
+                         use_private_key=None, gpu_batch_size=1 << 20, gpu_max_cu=None,
+                         utilization_pct=100,
+                         seed_num_words=0, seed_path_template=None, seed_depth_val=0):
     """GPU-accelerated search across one or more GPUs.
 
     Key generation runs in a ProcessPoolExecutor (bypasses GIL) so the
@@ -1180,7 +1243,7 @@ def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contrac
     producers_done = threading.Event()
 
     # Use multiprocessing for key generation to avoid GIL bottleneck
-    keygen_args = (wallet_prefix, wallet_suffix, use_private_key)
+    keygen_args = (wallet_prefix, wallet_suffix, use_private_key, seed_num_words, seed_path_template, seed_depth_val)
     keygen_count = 1 if use_private_key else max_keys
     worker_count = 1 if use_private_key else min(cpu_count, max_keys)
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
@@ -1216,17 +1279,17 @@ def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contrac
                         continue
                     if result is None:
                         continue
-                    wallet_address, local_key = result
+                    wallet_address, local_key, mnemonic, deriv_path = result
 
                     if not contract_prefix and not contract_suffix:
                         with result_lock:
-                            results.append((None, None, wallet_address, local_key))
+                            results.append((None, None, wallet_address, local_key, mnemonic, deriv_path))
                         found_event.set()
                         return
 
                     while not cancel_event.is_set() and not found_event.is_set():
                         try:
-                            candidate_queue.put((wallet_address, local_key), timeout=0.1)
+                            candidate_queue.put((wallet_address, local_key, mnemonic, deriv_path), timeout=0.1)
                             break
                         except queue.Full:
                             continue
@@ -1241,7 +1304,7 @@ def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contrac
                 break
 
             try:
-                wallet_address, local_private_key = candidate_queue.get(timeout=0.1)
+                wallet_address, local_private_key, mnemonic, deriv_path = candidate_queue.get(timeout=0.1)
             except queue.Empty:
                 if producers_done.is_set():
                     break
@@ -1253,13 +1316,14 @@ def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contrac
                     contract_prefix, contract_suffix,
                     batch_size=gpu_batch_size, max_cu=gpu_max_cu,
                     stop_event=found_event,
+                    utilization_pct=utilization_pct,
                 )
                 if found_event.is_set():
                     break
                 if nonce is not None:
                     addr = create_contract_address(Account.from_key(local_private_key), nonce)
                     with result_lock:
-                        results.append((nonce, addr, wallet_address, local_private_key))
+                        results.append((nonce, addr, wallet_address, local_private_key, mnemonic, deriv_path))
                     found_event.set()
                     break
             finally:
@@ -1288,8 +1352,71 @@ def search_with_gpu_accel(wallet_prefix, wallet_suffix, contract_prefix, contrac
 
     return results
 
+
+def search_with_seed(seed_num_words, derivation_path_template, depth,
+                     wallet_prefix, wallet_suffix,
+                     contract_prefix, contract_suffix,
+                     start_nonce, max_nonce, max_keys,
+                     gpu_searchers=None, gpu_batch_size=1 << 20,
+                     gpu_max_cu=None, utilization_pct=100):
+    """Generate random BIP-39 mnemonics and search derived addresses for matches."""
+    results = []
+    for _ in range(max_keys):
+        if cancel_event.is_set():
+            break
+        acct, mnemonic = Account.create_with_mnemonic(num_words=seed_num_words)
+        for idx in range(depth):
+            if cancel_event.is_set():
+                break
+            path = derivation_path_template.replace("{i}", str(idx))
+            try:
+                derived = Account.from_mnemonic(mnemonic, account_path=path)
+            except Exception:
+                continue
+
+            wallet_address = derived.address
+            local_key = derived.key.hex()
+
+            if not _wallet_matches(wallet_address, wallet_prefix, wallet_suffix):
+                continue
+
+            # Wallet-only mode
+            if not contract_prefix and not contract_suffix:
+                results.append((None, None, wallet_address, local_key, mnemonic, path))
+                return results
+
+            # Check contract nonces
+            nonce = None
+            if gpu_searchers:
+                searcher = gpu_searchers[0]
+                nonce = searcher.search_nonces(
+                    wallet_address[2:], start_nonce, max_nonce,
+                    contract_prefix, contract_suffix,
+                    batch_size=gpu_batch_size, max_cu=gpu_max_cu,
+                    utilization_pct=utilization_pct,
+                )
+            else:
+                nonce_result, _, _, found = search_address(
+                    derived, "", "", contract_prefix, contract_suffix,
+                    start_nonce, max_nonce,
+                )
+                if found:
+                    nonce = nonce_result
+
+            if nonce is not None:
+                addr = create_contract_address(derived, nonce)
+                results.append((nonce, addr, wallet_address, local_key, mnemonic, path))
+                return results
+
+    return results
+
+
 def input_private_key():
     global private_key
+
+    if seed_enabled_var.get():
+        messagebox.showinfo("Info", "Disable seed mode before entering a private key.")
+        return
 
     prompt_text = "Enter a private key (leave empty for a randomly generated one):"
     key = simpledialog.askstring("Private Key", prompt_text)
@@ -1323,7 +1450,14 @@ def set_ui_searching(searching):
     for chk in gpu_checks:
         chk.config(state=state if gpu_detected else 'disabled')
     gpu_batch_slider.config(state=state if gpu_detected else 'disabled')
-    gpu_cu_slider.config(state=state if gpu_detected else 'disabled')
+    gpu_util_slider.config(state=state if gpu_detected else 'disabled')
+    # Seed mode controls
+    seed_check.config(state=state)
+    seed_state = state if seed_enabled_var.get() else 'disabled'
+    seed_length_12.config(state=seed_state)
+    seed_length_24.config(state=seed_state)
+    seed_depth_entry.config(state=seed_state)
+    seed_path_entry.config(state=seed_state)
     if 'backend_button' in globals() and not backend_setup_in_progress:
         backend_button.config(state=state)
     _refresh_backend_status_ui()
@@ -1334,6 +1468,31 @@ def start_search():
     wallet_suffix = entry_wallet_suffix.get().strip()
     contract_prefix = entry_contract_prefix.get().strip()
     contract_suffix = entry_contract_suffix.get().strip()
+
+    # Seed mode validation
+    use_seed = seed_enabled_var.get()
+    seed_num_words = 0
+    seed_path_template = None
+    seed_depth = 0
+    if use_seed:
+        if not MNEMONIC_AVAILABLE:
+            messagebox.showerror("Error",
+                "Seed phrase support requires the 'eth-account' package.\n"
+                "Install it with: pip install eth-account")
+            return
+        seed_num_words = seed_length_var.get()
+        seed_path_template = seed_path_entry.get().strip()
+        if not seed_path_template or "{i}" not in seed_path_template:
+            messagebox.showerror("Error", "Derivation path must contain {i} as the index placeholder.")
+            return
+        try:
+            seed_depth = int(seed_depth_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Seed Depth must be a valid integer.")
+            return
+        if seed_depth < 1:
+            messagebox.showerror("Error", "Seed Depth must be at least 1.")
+            return
 
     if not is_valid_prefix_suffix(wallet_prefix, wallet_suffix) or not is_valid_prefix_suffix(contract_prefix, contract_suffix):
         messagebox.showerror("Error", "Prefix/suffix must be 10 characters or less and valid hexadecimal (0-9, a-f).")
@@ -1381,15 +1540,19 @@ def start_search():
     selected_gpu_indices = _selected_gpu_indices()
     gpu_requested = bool(selected_gpu_indices) and gpu_detected
     has_wallet_pattern = bool(wallet_prefix or wallet_suffix)
-    use_backend_gpu = gpu_requested and wallet_only and private_key is None and profanity2_available
+    # Seed mode uses deterministic derivation — profanity2 backend not applicable
+    use_backend_gpu = gpu_requested and wallet_only and private_key is None and profanity2_available and not use_seed
     use_combined_gpu = (
         gpu_requested and not wallet_only
         and has_wallet_pattern
         and private_key is None
+        and not use_seed
         and profanity2_available
     )
     use_opencl_gpu = gpu_requested and not wallet_only and not use_combined_gpu
-    if wallet_only:
+    if use_seed:
+        mode = f"Seed derivation ({seed_depth} paths)"
+    elif wallet_only:
         if use_backend_gpu:
             enabled_names = [all_gpus[i]['name'] for i in selected_gpu_indices]
             mode = f"GPU backend ({', '.join(enabled_names)})"
@@ -1420,7 +1583,42 @@ def start_search():
 
     def run():
         searchers = None
-        if use_backend_gpu:
+        if use_seed:
+            root.after(0, lambda: status_label.config(
+                text=f"Searching... Seed derivation  |  Checking {seed_depth} paths",
+                foreground="orange",
+            ))
+            try:
+                gpu_searcher_list = None
+                util_pct_val = 100
+                max_cu_seed = None
+                if gpu_requested and not wallet_only and GPU_AVAILABLE:
+                    batch_exp = gpu_batch_slider.get()
+                    batch_sz = 1 << batch_exp
+                    util_pct_val = gpu_util_slider.get()
+                    cu_max_val = max((g['compute_units'] for g in all_gpus), default=1)
+                    max_cu_seed = max(1, int(cu_max_val * util_pct_val / 100))
+                    enabled = [all_gpus[i] for i in selected_gpu_indices]
+                    gpu_searcher_list = [GPUSearcher(g['platform_idx'], g['device_idx']) for g in enabled]
+                else:
+                    batch_sz = 1 << 20
+
+                results = search_with_seed(
+                    seed_num_words, seed_path_template, seed_depth,
+                    wallet_prefix, wallet_suffix,
+                    contract_prefix, contract_suffix,
+                    start_nonce, max_nonce,
+                    max_keys=max_keys,
+                    gpu_searchers=gpu_searcher_list,
+                    gpu_batch_size=batch_sz,
+                    gpu_max_cu=max_cu_seed,
+                    utilization_pct=util_pct_val,
+                )
+            except Exception as e:
+                root.after(0, lambda: status_label.config(
+                    text=f"Seed search failed: {e}", foreground="red"))
+                results = []
+        elif use_backend_gpu:
             try:
                 # Use cached rate for initial ETA if available; real speed
                 # is detected inline from profanity2's live output —
@@ -1487,7 +1685,9 @@ def start_search():
         elif use_combined_gpu:
             batch_exp = gpu_batch_slider.get()
             batch_sz = 1 << batch_exp
-            max_cu_val = gpu_cu_slider.get()
+            util_pct = gpu_util_slider.get()
+            cu_max = max((g['compute_units'] for g in all_gpus), default=1)
+            max_cu_val = max(1, int(cu_max * util_pct / 100))
             try:
                 # Create one GPU searcher for nonce checking
                 enabled = [all_gpus[i] for i in selected_gpu_indices]
@@ -1531,6 +1731,7 @@ def start_search():
                     gpu_searcher=nonce_searcher,
                     gpu_batch_size=batch_sz, gpu_max_cu=max_cu_val,
                     on_speed_detected=_on_combined_speed,
+                    utilization_pct=util_pct,
                 )
             except Exception as e:
                 root.after(0, lambda: status_label.config(
@@ -1557,7 +1758,9 @@ def start_search():
         elif use_opencl_gpu:
             batch_exp = gpu_batch_slider.get()
             batch_sz = 1 << batch_exp
-            max_cu_val = gpu_cu_slider.get()
+            util_pct = gpu_util_slider.get()
+            cu_max = max((g['compute_units'] for g in all_gpus), default=1)
+            max_cu_val = max(1, int(cu_max * util_pct / 100))
             try:
                 enabled = [all_gpus[i] for i in selected_gpu_indices]
                 searchers = [GPUSearcher(g['platform_idx'], g['device_idx']) for g in enabled]
@@ -1569,6 +1772,7 @@ def start_search():
                     gpu_searchers=searchers,
                     gpu_batch_size=batch_sz,
                     gpu_max_cu=max_cu_val,
+                    utilization_pct=util_pct,
                 )
                 est_seconds = max_keys / keys_per_sec
                 est_full = expected_keys / keys_per_sec
@@ -1586,6 +1790,7 @@ def start_search():
                     start_nonce, max_nonce, max_keys, searchers,
                     use_private_key=private_key,
                     gpu_batch_size=batch_sz, gpu_max_cu=max_cu_val,
+                    utilization_pct=util_pct,
                 )
             except Exception as e:
                 root.after(0, lambda: status_label.config(
@@ -1676,32 +1881,36 @@ def on_search_done(results):
         return
 
     if results:
-        nonce, address, wallet_address, local_private_key = results[0]
+        nonce, address, wallet_address, local_private_key, mnemonic, deriv_path = results[0]
         status_label.config(text="Match found!", foreground="green")
 
         wallet_only = (nonce is None and address is None)
         if wallet_only:
             result_message = (
                 f"Congrats! Search successfully discovered:\n\n"
-                f"Wallet Address: {wallet_address}\n\n"
-                "Please copy and save the private key."
+                f"Wallet Address: {wallet_address}\n"
             )
         else:
             result_message = (
                 f"Congrats! Search successfully discovered:\n\n"
                 f"Contract Address: {address}\n"
                 f"Nonce: {nonce}\n"
-                f"Wallet Address: {wallet_address}\n\n"
-                "Please copy and save the private key."
+                f"Wallet Address: {wallet_address}\n"
             )
+        if mnemonic:
+            result_message += f"\nDerivation Path: {deriv_path}\n"
+            result_message += "\nPlease copy and save the seed phrase and private key."
+        else:
+            result_message += "\nPlease copy and save the private key."
+
         password_dialog = tk.Toplevel(root)
         password_dialog.title("Save Encrypted Private Key")
         password_dialog.resizable(False, False)
 
-        tk.Label(password_dialog, text=result_message, justify='left').grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky='w')
+        tk.Label(password_dialog, text=result_message, justify='left').grid(row=0, column=0, columnspan=3, padx=10, pady=10, sticky='w')
         tk.Label(password_dialog, text="Enter a password to encrypt the JSON file:").grid(row=1, column=0, padx=10, pady=10, sticky='w')
         password_entry = tk.Entry(password_dialog, show='*')
-        password_entry.grid(row=1, column=1, padx=10, pady=10)
+        password_entry.grid(row=1, column=1, columnspan=2, padx=10, pady=10)
 
         def save_encrypted_key():
             password = password_entry.get()
@@ -1709,6 +1918,16 @@ def on_search_done(results):
                 messagebox.showwarning("Warning", "Please enter a password to encrypt the key.", parent=password_dialog)
                 return
             encrypted_data = Account.encrypt(local_private_key, password)
+            # Include mnemonic in saved data if present
+            if mnemonic:
+                save_data = {
+                    "keystore": encrypted_data,
+                    "mnemonic": mnemonic,
+                    "derivation_path": deriv_path,
+                    "address": wallet_address,
+                }
+            else:
+                save_data = encrypted_data
             if wallet_only:
                 init_file = wallet_address
             else:
@@ -1722,15 +1941,22 @@ def on_search_done(results):
             )
             if file_path:
                 with open(file_path, "w") as file:
-                    json.dump(encrypted_data, file)
+                    json.dump(save_data, file)
                 messagebox.showinfo("Saved", "Encrypted key saved successfully.", parent=password_dialog)
             password_dialog.destroy()
 
         def copy_key():
             copy_private_key_to_clipboard(local_private_key)
 
-        ttk.Button(password_dialog, text="Copy Private Key", command=copy_key).grid(row=2, column=0, padx=10, pady=10)
-        ttk.Button(password_dialog, text="Save", command=save_encrypted_key).grid(row=2, column=1, padx=10, pady=10)
+        def copy_mnemonic():
+            pyperclip.copy(mnemonic)
+            messagebox.showinfo("Copied", "Seed phrase copied to clipboard.")
+
+        btn_row = 2
+        ttk.Button(password_dialog, text="Copy Private Key", command=copy_key).grid(row=btn_row, column=0, padx=10, pady=10)
+        if mnemonic:
+            ttk.Button(password_dialog, text="Copy Seed Phrase", command=copy_mnemonic).grid(row=btn_row, column=1, padx=10, pady=10)
+        ttk.Button(password_dialog, text="Save", command=save_encrypted_key).grid(row=btn_row, column=2, padx=10, pady=10)
 
         password_dialog.grab_set()
     else:
@@ -1743,7 +1969,8 @@ def main():
     global root, entry_wallet_prefix, entry_wallet_suffix, entry_contract_prefix
     global entry_contract_suffix, entry_start_nonce, entry_max_nonce, entry_max_keys
     global gpu_vars, gpu_checks, pk_button, search_button, cancel_button, status_label
-    global gpu_batch_slider, gpu_cu_slider, backend_status_label, backend_button
+    global gpu_batch_slider, gpu_util_slider, backend_status_label, backend_button
+    global seed_enabled_var, seed_length_var, seed_length_12, seed_length_24, seed_depth_entry, seed_path_entry, seed_check
 
     root = tk.Tk()
     root.title("CRYFT Vanity Tool")
@@ -1825,27 +2052,27 @@ def main():
         if any_enabled:
             gpu_batch_slider.grid()
             gpu_batch_label.grid()
-            gpu_cu_slider.grid()
-            gpu_cu_label.grid()
+            gpu_util_slider.grid()
+            gpu_util_label.grid()
             backend_status_label.grid()
             backend_button.grid()
             # Re-show the row labels too
             for w in gpu_frame.grid_slaves():
                 info = w.grid_info()
                 r = int(info.get('row', -1))
-                if r in (slider_start, slider_start + 1) and isinstance(w, ttk.Label) and w not in (gpu_batch_label, gpu_cu_label, backend_status_label):
+                if r in (slider_start, slider_start + 1) and isinstance(w, ttk.Label) and w not in (gpu_batch_label, gpu_util_label, backend_status_label):
                     w.grid()
         else:
             gpu_batch_slider.grid_remove()
             gpu_batch_label.grid_remove()
-            gpu_cu_slider.grid_remove()
-            gpu_cu_label.grid_remove()
+            gpu_util_slider.grid_remove()
+            gpu_util_label.grid_remove()
             backend_status_label.grid_remove()
             backend_button.grid_remove()
             for w in gpu_frame.grid_slaves():
                 info = w.grid_info()
                 r = int(info.get('row', -1))
-                if r in (slider_start, slider_start + 1) and isinstance(w, ttk.Label) and w not in (gpu_batch_label, gpu_cu_label, backend_status_label):
+                if r in (slider_start, slider_start + 1) and isinstance(w, ttk.Label) and w not in (gpu_batch_label, gpu_util_label, backend_status_label):
                     w.grid_remove()
 
     # Per-GPU checkboxes
@@ -1874,14 +2101,13 @@ def main():
     gpu_batch_label = ttk.Label(gpu_frame, text="1.0M nonces/batch (~1 MB)")
     gpu_batch_label.grid(row=slider_start, column=2, padx=5, pady=3, sticky='w')
 
-    # Compute units slider
-    cu_max = max((g['compute_units'] for g in all_gpus), default=1) if all_gpus else 1
-    ttk.Label(gpu_frame, text="Compute Units").grid(row=slider_start + 1, column=0, padx=5, pady=3, sticky='w')
-    gpu_cu_slider = tk.Scale(gpu_frame, from_=1, to=cu_max, orient=tk.HORIZONTAL)
-    gpu_cu_slider.set(cu_max)  # Default: use all
-    gpu_cu_slider.grid(row=slider_start + 1, column=1, padx=5, pady=3, sticky='ew')
-    gpu_cu_label = ttk.Label(gpu_frame, text=f"of {cu_max} available")
-    gpu_cu_label.grid(row=slider_start + 1, column=2, padx=5, pady=3, sticky='w')
+    # GPU Utilization slider (controls load to prevent power-related crashes)
+    ttk.Label(gpu_frame, text="GPU Utilization %").grid(row=slider_start + 1, column=0, padx=5, pady=3, sticky='w')
+    gpu_util_slider = tk.Scale(gpu_frame, from_=10, to=100, orient=tk.HORIZONTAL, resolution=5)
+    gpu_util_slider.set(100)  # Default: full utilization
+    gpu_util_slider.grid(row=slider_start + 1, column=1, padx=5, pady=3, sticky='ew')
+    gpu_util_label = ttk.Label(gpu_frame, text="Lower if GPU crashes from insufficient power")
+    gpu_util_label.grid(row=slider_start + 1, column=2, padx=5, pady=3, sticky='w')
 
     backend_status_label = ttk.Label(gpu_frame, text="", foreground="gray")
     backend_status_label.grid(row=slider_start + 2, column=0, columnspan=3, padx=5, pady=(8, 2), sticky='w')
@@ -1892,15 +2118,66 @@ def main():
     _toggle_gpu_sliders()
     _refresh_backend_status_ui()
 
+    # Seed Phrase frame
+    seed_frame = ttk.LabelFrame(root, text="Seed Phrase Derivation")
+    seed_frame.grid(row=9, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+    seed_frame.columnconfigure(1, weight=1)
+
+    seed_enabled_var = tk.BooleanVar(value=False)
+    seed_length_var = tk.IntVar(value=12)
+
+    def _toggle_seed_mode():
+        enabled = seed_enabled_var.get()
+        state = 'normal' if enabled else 'disabled'
+        seed_length_12.config(state=state)
+        seed_length_24.config(state=state)
+        seed_depth_entry.config(state=state)
+        seed_path_entry.config(state=state)
+        if enabled:
+            # Seed mode is incompatible with custom private key
+            global private_key
+            private_key = None
+            pk_button.config(state='disabled')
+            status_label.config(text="Seed mode enabled — generating random mnemonics.", foreground="blue")
+        else:
+            pk_button.config(state='normal')
+            status_label.config(text="Seed mode disabled.", foreground="gray")
+
+    seed_check = ttk.Checkbutton(seed_frame, text="Enable seed phrase generation",
+                                  variable=seed_enabled_var, command=_toggle_seed_mode)
+    seed_check.grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky='w')
+
+    ttk.Label(seed_frame, text="Seed Length").grid(row=1, column=0, padx=5, pady=3, sticky='w')
+    seed_len_frame = ttk.Frame(seed_frame)
+    seed_len_frame.grid(row=1, column=1, padx=5, pady=3, sticky='w')
+    seed_length_12 = ttk.Radiobutton(seed_len_frame, text="12 words", variable=seed_length_var, value=12)
+    seed_length_12.pack(side='left', padx=(0, 10))
+    seed_length_12.config(state='disabled')
+    seed_length_24 = ttk.Radiobutton(seed_len_frame, text="24 words", variable=seed_length_var, value=24)
+    seed_length_24.pack(side='left')
+    seed_length_24.config(state='disabled')
+
+    ttk.Label(seed_frame, text="Derivation Path").grid(row=2, column=0, padx=5, pady=3, sticky='w')
+    seed_path_entry = ttk.Entry(seed_frame)
+    seed_path_entry.grid(row=2, column=1, padx=5, pady=3, sticky='ew')
+    seed_path_entry.insert(0, "m/44'/60'/0'/0/{i}")
+    seed_path_entry.config(state='disabled')
+
+    ttk.Label(seed_frame, text="Seed Depth").grid(row=3, column=0, padx=5, pady=3, sticky='w')
+    seed_depth_entry = ttk.Entry(seed_frame)
+    seed_depth_entry.grid(row=3, column=1, padx=5, pady=3, sticky='ew')
+    seed_depth_entry.insert(0, "100")
+    seed_depth_entry.config(state='disabled')
+
     # Optional private key
-    ttk.Label(root, text="Optional", font=('Montserrat', 8)).grid(row=9, column=0, columnspan=2, pady=(5, 0))
+    ttk.Label(root, text="Optional", font=('Montserrat', 8)).grid(row=10, column=0, columnspan=2, pady=(5, 0))
 
     pk_button = ttk.Button(root, text='Enter Private Key', command=input_private_key)
-    pk_button.grid(row=10, column=0, columnspan=2, padx=10, pady=5)
+    pk_button.grid(row=11, column=0, columnspan=2, padx=10, pady=5)
 
     # Search / Cancel buttons side-by-side
     btn_frame = ttk.Frame(root)
-    btn_frame.grid(row=11, column=0, columnspan=2, padx=10, pady=5)
+    btn_frame.grid(row=12, column=0, columnspan=2, padx=10, pady=5)
     search_button = ttk.Button(btn_frame, text='Search', command=start_search)
     search_button.pack(side='left', padx=5)
     cancel_button = ttk.Button(btn_frame, text='Cancel', command=cancel_search, state='disabled')
@@ -1915,7 +2192,7 @@ def main():
         ready_text += ", wallet GPU backend available"
     ready_text += " available"
     status_label = ttk.Label(root, text=ready_text, foreground="gray", font=('Montserrat', 9))
-    status_label.grid(row=12, column=0, columnspan=2, padx=10, pady=(0, 10))
+    status_label.grid(row=13, column=0, columnspan=2, padx=10, pady=(0, 10))
 
     root.mainloop()
 
