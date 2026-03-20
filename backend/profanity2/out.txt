@@ -1,0 +1,10 @@
+Mode: benchmark
+Target: Address
+Devices:
+  GPU0: NVIDIA GeForce RTX 5070 Ti, 17094475776 bytes available, 70 compute units (precompiled = yes)
+
+Initializing OpenCL...
+  Creating context...OK
+  Loading kernel from binary...OK
+  Building program...OK
+
